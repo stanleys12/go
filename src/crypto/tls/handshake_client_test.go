@@ -7,8 +7,11 @@ package tls
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/hkdf"
+	"crypto/internal/fips140/tls13"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls/internal/fips140tls"
@@ -32,6 +35,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"golang.org/x/crypto/cryptobyte"
 )
 
 // Note: see comment in handshake_test.go for details of how the reference
@@ -2934,6 +2939,116 @@ func TestTLS13ECHRejectionCallbacks(t *testing.T) {
 				t.Fatalf("unexpected err: got %q, want %q", clientErr, tc.expectedErr)
 			}
 		})
+	}
+}
+
+func TestECHRejectedInHelloRetryRequest(t *testing.T) {
+	// A server which doesn't confirm ECH in its HelloRetryRequest can't accept
+	// it in the ServerHello either: we send a second ClientHelloOuter, so the
+	// inner transcript is missing the second ClientHelloInner. See RFC 9849,
+	// Section 6.1.4.
+	echKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	echConfig := marshalECHConfig(extensionEncryptedClientHello, 123, echKey.PublicKey().Bytes(), "public.example", 32)
+	builder := cryptobyte.NewBuilder(nil)
+	builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+		builder.AddBytes(echConfig)
+	})
+	echConfigList := builder.BytesOrPanic()
+
+	clientConfig := testConfigClient()
+	clientConfig.MinVersion = VersionTLS13
+	clientConfig.ServerName = "secret.example"
+	clientConfig.EncryptedClientHelloConfigList = echConfigList
+
+	c, s := localPipe(t)
+	defer c.Close()
+	defer s.Close()
+	client := Client(c, clientConfig)
+	errChan := make(chan error, 1)
+	go func() {
+		errChan <- client.Handshake()
+	}()
+
+	server := &Conn{conn: s, config: testConfigServer()}
+	msg, err := server.readHandshake(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	outer, ok := msg.(*clientHelloMsg)
+	if !ok {
+		t.Fatalf("unexpected message type %T", msg)
+	}
+	// As a real server would, select the version before answering, so that the
+	// dummy ChangeCipherSpec of the second flight is ignored.
+	server.vers, server.haveVers = VersionTLS13, true
+	inner, _, err := server.processECHClientHello(outer, []EncryptedClientHelloKey{
+		{Config: echConfig, PrivateKey: echKey.Bytes()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	suite := cipherSuiteTLS13ByID(TLS_AES_128_GCM_SHA256)
+	innerTranscript := suite.hash.New()
+	innerTranscript.Write(inner.original)
+	chHash := innerTranscript.Sum(nil)
+	innerTranscript.Reset()
+	innerTranscript.Write([]byte{typeMessageHash, 0, 0, uint8(len(chHash))})
+	innerTranscript.Write(chHash)
+
+	// The HelloRetryRequest carries no acceptance confirmation, while the
+	// ServerHello below confirms ECH against the transcript the client is left
+	// with.
+	helloRetryRequest := &serverHelloMsg{
+		vers:              VersionTLS12,
+		random:            helloRetryRequestRandom,
+		sessionId:         outer.sessionId,
+		cipherSuite:       suite.id,
+		compressionMethod: compressionNone,
+		supportedVersion:  VersionTLS13,
+		cookie:            []byte("cookie"),
+	}
+	if _, err := server.writeHandshakeRecord(helloRetryRequest, innerTranscript); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := server.readHandshake(nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// The ServerHello is missing a key share, so the handshake fails right
+	// after the acceptance confirmation is checked.
+	serverHello := &serverHelloMsg{
+		vers:              VersionTLS12,
+		random:            make([]byte, 32),
+		sessionId:         outer.sessionId,
+		cipherSuite:       suite.id,
+		compressionMethod: compressionNone,
+		supportedVersion:  VersionTLS13,
+	}
+	serverHelloBytes, err := serverHello.marshal()
+	if err != nil {
+		t.Fatal(err)
+	}
+	innerTranscript.Write(serverHelloBytes)
+	h := suite.hash.New
+	prk, err := hkdf.Extract(h, inner.random, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copy(serverHello.random[32-8:], tls13.ExpandLabel(h, prk, "ech accept confirmation", innerTranscript.Sum(nil), 8))
+	if _, err := server.writeHandshakeRecord(serverHello, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	const expectedErr = "tls: server did not send a key share"
+	if err := <-errChan; err == nil || err.Error() != expectedErr {
+		t.Errorf("unexpected handshake error: got %q, want %q", err, expectedErr)
+	}
+	if client.ConnectionState().ECHAccepted {
+		t.Error("client accepted ECH although the HelloRetryRequest rejected it")
 	}
 }
 

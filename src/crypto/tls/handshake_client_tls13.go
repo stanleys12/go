@@ -85,7 +85,7 @@ func (hs *clientHandshakeStateTLS13) handshake() error {
 		}
 	}
 
-	if hs.echContext != nil {
+	if hs.echContext != nil && !hs.echContext.echRejected {
 		confTranscript := cloneHash(hs.echContext.innerTranscript, hs.suite.hash)
 		confTranscript.Write(hs.serverHello.original[:30])
 		confTranscript.Write(make([]byte, 8))
@@ -278,6 +278,14 @@ func (hs *clientHandshakeStateTLS13) processHelloRetryRequest() error {
 				isInnerHello = true
 				c.echAccepted = true
 			}
+		}
+
+		if !isInnerHello {
+			// We are about to send a second ClientHelloOuter, which means the
+			// inner transcript will be missing the second ClientHelloInner, so
+			// the server can't accept ECH in the ServerHello anymore. See RFC
+			// 9849, Section 6.1.4.
+			hs.echContext.echRejected = true
 		}
 
 		if err := transcriptMsg(hs.serverHello, hs.echContext.innerTranscript); err != nil {

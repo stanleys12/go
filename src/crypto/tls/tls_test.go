@@ -2613,6 +2613,29 @@ func TestLargeCertMsg(t *testing.T) {
 	}
 }
 
+func marshalECHConfig(version uint16, id uint8, pubKey []byte, publicName string, maxNameLen uint8) []byte {
+	builder := cryptobyte.NewBuilder(nil)
+	builder.AddUint16(version)
+	builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+		builder.AddUint8(id)
+		builder.AddUint16(0x0020 /* DHKEM(X25519, HKDF-SHA256) */)
+		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddBytes(pubKey)
+		})
+		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddUint16(0x0001 /* HKDF-SHA256 */)
+			builder.AddUint16(0x0001 /* AES-128-GCM */)
+		})
+		builder.AddUint8(maxNameLen)
+		builder.AddUint8LengthPrefixed(func(builder *cryptobyte.Builder) {
+			builder.AddBytes([]byte(publicName))
+		})
+		builder.AddUint16(0) // extensions
+	})
+
+	return builder.BytesOrPanic()
+}
+
 func TestECH(t *testing.T) {
 	k, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -2640,29 +2663,6 @@ func TestECH(t *testing.T) {
 	secretCert, err := x509.ParseCertificate(secretCertDER)
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	marshalECHConfig := func(version uint16, id uint8, pubKey []byte, publicName string, maxNameLen uint8) []byte {
-		builder := cryptobyte.NewBuilder(nil)
-		builder.AddUint16(version)
-		builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
-			builder.AddUint8(id)
-			builder.AddUint16(0x0020 /* DHKEM(X25519, HKDF-SHA256) */)
-			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
-				builder.AddBytes(pubKey)
-			})
-			builder.AddUint16LengthPrefixed(func(builder *cryptobyte.Builder) {
-				builder.AddUint16(0x0001 /* HKDF-SHA256 */)
-				builder.AddUint16(0x0001 /* AES-128-GCM */)
-			})
-			builder.AddUint8(maxNameLen)
-			builder.AddUint8LengthPrefixed(func(builder *cryptobyte.Builder) {
-				builder.AddBytes([]byte(publicName))
-			})
-			builder.AddUint16(0) // extensions
-		})
-
-		return builder.BytesOrPanic()
 	}
 
 	echKey, err := ecdh.X25519().GenerateKey(rand.Reader)
